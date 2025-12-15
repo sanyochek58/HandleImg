@@ -21,7 +21,7 @@ public class ImageController {
     @PostMapping(value = "/loadImages", consumes = "multipart/form-data")
     public ResponseEntity<?> loadImages(
             @RequestPart("files") List<MultipartFile> files,
-            @RequestPart("groupName") String groupName,
+            @RequestPart("projectName") String projectName,
             @RequestPart("imageDTO") String imageDTOJson
     ) {
         try {
@@ -30,7 +30,7 @@ public class ImageController {
                     mapper.readValue(imageDTOJson, ImageDTO[].class)
             );
 
-            imageService.uploadProject(files, groupName, imageDTOs);
+            imageService.uploadProject(files, projectName, imageDTOs);
             return ResponseEntity.ok().build();
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(e.getMessage());

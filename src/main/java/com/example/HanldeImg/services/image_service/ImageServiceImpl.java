@@ -32,9 +32,9 @@ public class ImageServiceImpl implements ImageService {
 
     @Override
     @Transactional
-    public void uploadProject(List<MultipartFile> files, String dirName, List<ImageDTO> imageDTOList) {
+    public void uploadProject(List<MultipartFile> files, String projectName, List<ImageDTO> imageDTOList) {
 
-        Path targetDir = Path.of(BASE_UPLOAD_DIRECTORY, dirName);
+        Path targetDir = Path.of(BASE_UPLOAD_DIRECTORY, projectName);
 
         List<Image> imagesToSave = new ArrayList<>();
 
@@ -76,6 +76,10 @@ public class ImageServiceImpl implements ImageService {
         imageRepository.saveAll(imagesToSave);
 
         try{
+            ImageScripts.ensure(
+                    System.getenv("GIT_GROUP_NAME"),
+                    projectName
+            );
             ImageScripts.pushToGitLab(targetDir);
         }catch (Exception e){
             log.info("Ошибка при загрузки образа на gitlab");
@@ -83,48 +87,7 @@ public class ImageServiceImpl implements ImageService {
         }
     }
 
-
     @Override
-    public void updateProject(List<MultipartFile> files, String dirName){
-        Path targetDir = Path.of(BASE_UPLOAD_DIRECTORY, dirName);
-
-        List<Path> tempFiles = new ArrayList<>();
-
-        try{
-            for (MultipartFile file : files) {
-                if (file.isEmpty()) continue;
-
-                File tempFile = File.createTempFile("update_", file.getOriginalFilename());
-                file.transferTo(tempFile);
-
-                tempFiles.add(tempFile.toPath());
-            }
-
-            if (tempFiles.isEmpty()){
-                throw new IllegalArgumentException("Все переданные файлы пустые");
-            }
-
-            try{
-                ImageScripts.updateGitRepo(tempFiles, targetDir, dirName);
-            }catch (Exception e){
-                log.info("Ошибка при обновлении проекта {}", e.getMessage());
-            }
-        }catch (IOException e){
-            log.error("Ошибка при сохранении временных файлов обновления для проекта {}", dirName, e);
-            throw new RuntimeException("Ошибка при сохранении временных файлов обновления", e);
-        }
-        finally {
-            for (Path temp : tempFiles) {
-                try {
-                    File f = temp.toFile();
-                    if (f.exists() && !f.delete()) {
-                        log.warn("Не удалось удалить временный файл {}", temp);
-                    }
-                } catch (Exception ex) {
-                    log.warn("Ошибка при удалении временного файла {}", temp, ex);
-                }
-            }
-        }
-    }
+    public void updateProject(List<MultipartFile> files, String dirName) {/*TODO*/}
 
 }

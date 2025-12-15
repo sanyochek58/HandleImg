@@ -1,10 +1,14 @@
 package com.example.HanldeImg.scripts;
 
+import org.gitlab4j.api.GitLabApi;
+import org.gitlab4j.api.GitLabApiException;
+import org.gitlab4j.api.models.Group;
+import org.gitlab4j.api.models.Project;
+import org.gitlab4j.models.Constants;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
@@ -12,16 +16,12 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Comparator;
 import java.util.List;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
-
-import static java.io.FileDescriptor.out;
-
 
 public class ImageScripts {
 
     private static final String DEFAULT_7Z_PATH = "/usr/local/bin/7z";
-    private static final String GIT_GROUP = "automobiles";
+    private static final String GIT_GROUP = System.getenv("GIT_GROUP_NAME");
     private static final Logger log = LoggerFactory.getLogger(ImageScripts.class.getName());
 
     private static String findArchivator() {
@@ -175,109 +175,44 @@ public class ImageScripts {
         }
     }
 
-    public static void updateGitRepo(List<Path> archives, Path targetDir, String projectName) throws IOException, InterruptedException {
-        if(!(Files.exists(targetDir) && Files.exists(targetDir.resolve(".git")))) {
-            Files.createDirectories(targetDir.getParent());
+    public static void ensure(String groupName, String projectName) throws GitLabApiException {
+        GitLabApi api = new GitLabApi(
+                System.getenv("GIT_URL"),
+                Constants.TokenType.PRIVATE,
+                System.getenv("GIT_TOKEN")
+        );
 
-            String gitRepo = "git@100.98.83.30:" + GIT_GROUP + "/" + projectName.toLowerCase() + ".git";
-
-            log.info("Клонируем репозиторий {}", gitRepo);
-            ProcessBuilder clonePb = new ProcessBuilder("git", "clone", gitRepo, targetDir.toString());
-            clonePb.redirectErrorStream(true);
-            Process process = clonePb.start();
-            int cloneExitCode = process.waitFor();
-            if (cloneExitCode != 0) {
-                throw new RuntimeException("git clone failed with code " + cloneExitCode);
-            }
-        }else {
-            log.info("Репозиторий {} уже существует локально, пропускаем clone", projectName);
-        }
-
-        try(Stream<Path> stream = Files.list(targetDir)){
-            stream.forEach(path -> {
-                String name = path.getFileName().toString();
-                if(".git".equals(name)) {
-                    return;
-                }
-                else{
-                    try {
-                        if(Files.isDirectory(path)) {
-                            try(Stream<Path> walk = Files.walk(path)){
-                                walk.sorted(Comparator.reverseOrder())
-                                .forEach(p -> {
-                                    try{
-                                        Files.deleteIfExists(p);
-                                    }catch(IOException e) {
-                                        throw new RuntimeException(e);
-                                    }
-                                });
-                            }
-                        }else {
-                            Files.deleteIfExists(path);
-                        }
-                    }catch (IOException e) {
+        Group group = api.getGroupApi().getGroups(groupName).stream().
+                filter(g -> g.getName().equalsIgnoreCase(groupName)).findFirst().orElseGet(() -> {
+                    try{
+                        return api.getGroupApi().addGroup(
+                                groupName,
+                                groupName.toLowerCase()
+                        );
+                    }catch (Exception e){
                         throw new RuntimeException(e);
                     }
+                });
+
+        String projectPath = projectName.toLowerCase();
+        String fullPath = group.getFullPath() + "/" + projectName.toLowerCase();
+        try{
+            api.getProjectApi().getProject(fullPath);
+        }catch (GitLabApiException e){
+            if (e.getHttpStatus() == 404) {
+                Project p = new Project()
+                        .withName(projectName)
+                        .withPath(projectPath)
+                        .withNamespaceId(group.getId())
+                        .withLfsEnabled(true);
+
+                try{
+                    api.getProjectApi().createProject(p);
+                }catch(Exception ex){
+                    throw new RuntimeException(ex);
                 }
-            });
-        }
-
-        log.info("Рабочая директория {} очищена (кроме .git)", targetDir);
-
-        for(Path path : archives){
-            log.info("Распаковка нового образа {} в {}", path, targetDir);
-            extractImgWith7z(path, targetDir);
-        }
-
-        log.info("Добавление файлов образа в проект");
-        ProcessBuilder addPb = new ProcessBuilder("git", "add", ".");
-        addPb.directory(targetDir.toFile());
-        addPb.redirectErrorStream(true);
-        int addCode = addPb.start().waitFor();
-        if (addCode != 0) {
-            throw new RuntimeException("git add . failed with code " + addCode);
-        }
-
-        log.info("Коммитим изменения");
-        ProcessBuilder commitPb = new ProcessBuilder("git", "commit", "--allow-empty", "-m", "UPDATED IMAGES");
-        commitPb.directory(targetDir.toFile());
-        commitPb.redirectErrorStream(true);
-
-        Process commitProcess = commitPb.start();
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(commitProcess.getInputStream()))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                log.info("[git commit] {}", line);
             }
         }
-        int commitCode = commitProcess.waitFor();
-        if (commitCode != 0) {
-            log.warn("git commit завершился с кодом {} (возможно, нечего коммитить)", commitCode);
-        }
-
-        log.info("Пушим содержимое в репозиторий");
-        ProcessBuilder pushPb = new ProcessBuilder("git", "push", "-u", "origin", "main", "-v");
-        pushPb.directory(targetDir.toFile());
-        pushPb.redirectErrorStream(true);
-        pushPb.environment().put("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
-
-        Process pushProcess = pushPb.start();
-        StringBuilder output = new StringBuilder();
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(pushProcess.getInputStream()))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                output.append(line).append("\n");
-                log.info("[git push] {}", line);
-            }
-        }
-        int pushCode = pushProcess.waitFor();
-        log.info("git push exit code = {}", pushCode);
-
-        if (pushCode != 0) {
-            throw new RuntimeException("git push failed with exit code " + pushCode + "\nOutput:\n" + output);
-        }
-
     }
 
 }
-
