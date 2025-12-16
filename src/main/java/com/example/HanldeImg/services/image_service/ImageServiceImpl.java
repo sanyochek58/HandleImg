@@ -15,6 +15,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.File;
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDateTime;
@@ -31,41 +32,20 @@ public class ImageServiceImpl implements ImageService {
     private static final Logger log = LoggerFactory.getLogger(ImageServiceImpl.class);
 
     @Override
-    @Transactional
-    public void uploadProject(List<MultipartFile> files, String projectName, List<ImageDTO> imageDTOList) {
+    public void uploadProject(List<MultipartFile> files, String projectName) {
 
         Path targetDir = Path.of(BASE_UPLOAD_DIRECTORY, projectName);
 
-        List<Image> imagesToSave = new ArrayList<>();
 
         for (int i = 0; i < files.size(); i++) {
             MultipartFile file = files.get(i);
             if (file.isEmpty()) continue;
 
-            ImageDTO dto = imageDTOList.get(i);
 
             try {
                 File tempFile = File.createTempFile("upload_", file.getOriginalFilename());
                 file.transferTo(tempFile);
-
                 ImageScripts.extractImgWith7z(tempFile.toPath(), targetDir);
-
-                // Создаём сущность для БД ТОЛЬКО если распаковка успешна
-                Image image = new Image();
-                image.setImgName(dto.name() != null ? dto.name() : file.getOriginalFilename());
-                image.setCreateTime(
-                        dto.createdDate() != null
-                                ? dto.createdDate().atStartOfDay()
-                                : LocalDateTime.now()
-                );
-                image.setStatus(
-                        dto.status() != null
-                                ? Status.valueOf(dto.status())
-                                : Status.ACTIVE
-                );
-
-                imagesToSave.add(image);
-
                 tempFile.delete();
 
             } catch (IOException | InterruptedException e) {
@@ -73,7 +53,6 @@ public class ImageServiceImpl implements ImageService {
             }
         }
 
-        imageRepository.saveAll(imagesToSave);
 
         try{
             ImageScripts.ensure(
@@ -88,6 +67,42 @@ public class ImageServiceImpl implements ImageService {
     }
 
     @Override
-    public void updateProject(List<MultipartFile> files, String dirName) {/*TODO*/}
+    public void updateProject(List<MultipartFile> files, String dirName) {
+
+        Path targetDir = Path.of(BASE_UPLOAD_DIRECTORY, dirName);
+
+        List<Path> tempPaths = new ArrayList<>();
+
+        try {
+            // 1) Сохраняем MultipartFile во временные файлы -> List<Path>
+            for (MultipartFile file : files) {
+                if (file == null || file.isEmpty()) continue;
+
+                File tempFile = File.createTempFile("upload_", "_" + file.getOriginalFilename());
+                file.transferTo(tempFile);
+                tempPaths.add(tempFile.toPath());
+            }
+
+            // 2) ensure проекта в GitLab
+            ImageScripts.ensure(System.getenv("GIT_GROUP_NAME"), dirName);
+
+            // 3) обновление: очистка папки + распаковка + commit + push
+            ImageScripts.updateImages(targetDir, tempPaths);
+
+        } catch (Exception e) {
+            log.info("Ошибка при обновлении проекта на gitlab");
+            throw new RuntimeException(e.getMessage(), e);
+
+        } finally {
+            for (Path p : tempPaths) {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException ex) {
+                    log.warn("Не смог удалить temp файл: {}", p, ex);
+                }
+            }
+        }
+    }
+
 
 }

@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
@@ -23,14 +24,13 @@ public class ImageScripts {
     private static final String DEFAULT_7Z_PATH = "/usr/local/bin/7z";
     private static final String GIT_GROUP = System.getenv("GIT_GROUP_NAME");
     private static final Logger log = LoggerFactory.getLogger(ImageScripts.class.getName());
+    public static final String[] ignore = new String[] {".gitignore", ".git", ".gitattributes"};
 
     private static String findArchivator() {
         Path p = Paths.get(DEFAULT_7Z_PATH);
-
         if (Files.exists(p) && Files.isExecutable(p)) {
             return p.toString();
         }
-
         return "7z";
     }
 
@@ -212,6 +212,217 @@ public class ImageScripts {
                     throw new RuntimeException(ex);
                 }
             }
+        }
+    }
+
+    public static void updateImages(Path targetDir, List<Path> images) throws GitLabApiException, Exception {
+
+        String repoName = targetDir.getFileName().toString();
+        String gitRemote = "git@100.98.83.30:" + GIT_GROUP + "/" + repoName.toLowerCase() + ".git";
+
+        log.info("Updating to gitlab");
+
+        Path gitDir = targetDir.resolve(".git");
+
+        Files.createDirectories(targetDir);
+
+        if (!Files.exists(gitDir)) {
+            log.info("Локальный репозиторий не найден — инициализируем");
+
+            log.info("Инициализация гит проекта");
+            ProcessBuilder initPb = new ProcessBuilder("git", "init");
+            initPb.directory(targetDir.toFile());
+            initPb.redirectErrorStream(true);
+            int initCode = initPb.start().waitFor();
+            if (initCode != 0) throw new RuntimeException("git init failed with code " + initCode);
+
+            log.info("Создание ветки: main");
+            ProcessBuilder branchPb = new ProcessBuilder("git", "branch", "-M", "main");
+            branchPb.directory(targetDir.toFile());
+            branchPb.redirectErrorStream(true);
+            int branchCode = branchPb.start().waitFor();
+            if (branchCode != 0) throw new RuntimeException("git branch -M main failed with code " + branchCode);
+
+            log.info("Создание подключения к проекту в GitLab");
+            ProcessBuilder remotePb = new ProcessBuilder("git", "remote", "add", "origin", gitRemote);
+            remotePb.directory(targetDir.toFile());
+            remotePb.redirectErrorStream(true);
+            int remoteCode = remotePb.start().waitFor();
+            if (remoteCode != 0) throw new RuntimeException("git remote add origin failed with code " + remoteCode);
+
+        } else {
+            log.info("Локальный репозиторий уже существует — используем существующий");
+
+            log.info("Проверяем/обновляем origin");
+            ProcessBuilder setUrlPb = new ProcessBuilder("git", "remote", "set-url", "origin", gitRemote);
+            setUrlPb.directory(targetDir.toFile());
+            setUrlPb.redirectErrorStream(true);
+            int setUrlCode = setUrlPb.start().waitFor();
+            if (setUrlCode != 0) {
+                log.warn("git remote set-url origin завершился с кодом {}, продолжаем", setUrlCode);
+            }
+        }
+
+
+        log.info("Подтягиваем изменения из origin (fetch)");
+        ProcessBuilder fetchPb = new ProcessBuilder("git", "fetch", "origin", "-v");
+        fetchPb.directory(targetDir.toFile());
+        fetchPb.redirectErrorStream(true);
+        fetchPb.environment().put("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+
+        Process fetchProcess = fetchPb.start();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(fetchProcess.getInputStream()))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                log.info("[git fetch] {}", line);
+            }
+        }
+        int fetchCode = fetchProcess.waitFor();
+        log.info("git fetch exit code = {}", fetchCode);
+        if (fetchCode != 0) {
+            throw new RuntimeException("git fetch failed with exit code " + fetchCode);
+        }
+
+        log.info("Переключаемся на main");
+        ProcessBuilder checkoutPb = new ProcessBuilder("git", "checkout", "-B", "main");
+        checkoutPb.directory(targetDir.toFile());
+        checkoutPb.redirectErrorStream(true);
+        int checkoutCode = checkoutPb.start().waitFor();
+        if (checkoutCode != 0) {
+            throw new RuntimeException("git checkout -B main failed with code " + checkoutCode);
+        }
+
+        log.info("Сбрасываем локальные изменения в состояние origin/main (если ветка существует)");
+        ProcessBuilder resetPb = new ProcessBuilder("git", "reset", "--hard", "origin/main");
+        resetPb.directory(targetDir.toFile());
+        resetPb.redirectErrorStream(true);
+        Process resetProcess = resetPb.start();
+
+        StringBuilder resetOut = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(resetProcess.getInputStream()))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                resetOut.append(line).append("\n");
+                log.info("[git reset] {}", line);
+            }
+        }
+        int resetCode = resetProcess.waitFor();
+        if (resetCode != 0) {
+            // Это нормально, если remote пустой и ветки main ещё нет
+            log.warn("git reset --hard origin/main завершился с кодом {} (возможно, remote ещё пустой). Продолжаем.\n{}",
+                    resetCode, resetOut);
+        }
+
+        // ===== 3. Полная очистка папки (кроме .git и ignore) =====
+        log.info("Очищаем папку проекта (кроме .git/.gitignore/.gitattributes)");
+        wipeDirectoryExceptGit(targetDir);
+
+        // ===== 4. Распаковка новых образов =====
+        log.info("Распаковываем новые образы в {}", targetDir.toAbsolutePath());
+        for (Path img : images) {
+            if (img == null) continue;
+            log.info("Распаковка: {}", img.toAbsolutePath());
+            extractImgWith7z(img, targetDir);
+        }
+
+        // ===== 5. git add =====
+        log.info("Добавление файлов образа в проект");
+        ProcessBuilder addPb = new ProcessBuilder("git", "add", ".");
+        addPb.directory(targetDir.toFile());
+        addPb.redirectErrorStream(true);
+        int addCode = addPb.start().waitFor();
+        if (addCode != 0) throw new RuntimeException("git add . failed with code " + addCode);
+
+        // ===== 6. commit =====
+        log.info("Коммитим изменения");
+        ProcessBuilder commitPb = new ProcessBuilder("git", "commit", "--allow-empty", "-m", "Auto-update uploaded files");
+        commitPb.directory(targetDir.toFile());
+        commitPb.redirectErrorStream(true);
+
+        Process commitProcess = commitPb.start();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(commitProcess.getInputStream()))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                log.info("[git commit] {}", line);
+            }
+        }
+        int commitCode = commitProcess.waitFor();
+        if (commitCode != 0) {
+            log.warn("git commit завершился с кодом {} (возможно, нечего коммитить)", commitCode);
+        }
+
+        // ===== 7. pull --rebase (чтобы не словить fetch first) =====
+        log.info("Делаем pull --rebase перед push (чтобы не было fetch first)");
+        ProcessBuilder pullPb = new ProcessBuilder("git", "pull", "--rebase", "origin", "main", "-v");
+        pullPb.directory(targetDir.toFile());
+        pullPb.redirectErrorStream(true);
+        pullPb.environment().put("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+
+        Process pullProcess = pullPb.start();
+        StringBuilder pullOut = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(pullProcess.getInputStream()))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                pullOut.append(line).append("\n");
+                log.info("[git pull] {}", line);
+            }
+        }
+        int pullCode = pullProcess.waitFor();
+        if (pullCode != 0) {
+            // бывает, если remote пустой/нет main — не критично
+            log.warn("git pull --rebase завершился с кодом {}. Продолжаем.\n{}", pullCode, pullOut);
+        }
+
+        // ===== 8. push =====
+        log.info("Пушим обновления в репозиторий");
+        ProcessBuilder pushPb = new ProcessBuilder("git", "push", "-u", "origin", "main", "-v");
+        pushPb.directory(targetDir.toFile());
+        pushPb.redirectErrorStream(true);
+        pushPb.environment().put("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+
+        Process pushProcess = pushPb.start();
+        StringBuilder pushOut = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(pushProcess.getInputStream()))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                pushOut.append(line).append("\n");
+                log.info("[git push] {}", line);
+            }
+        }
+        int pushCode = pushProcess.waitFor();
+        log.info("git push exit code = {}", pushCode);
+
+        if (pushCode != 0) {
+            throw new RuntimeException("git push failed with exit code " + pushCode + "\nOutput:\n" + pushOut);
+        }
+    }
+
+    private static void wipeDirectoryExceptGit(Path folder) throws IOException {
+        if (!Files.exists(folder)) return;
+
+        try (Stream<Path> walk = Files.walk(folder)) {
+            walk.sorted(Comparator.reverseOrder())
+                    .filter(p -> !p.equals(folder))
+                    .filter(p -> {
+                        String name = p.getFileName().toString();
+                        // не трогаем .git и всё внутри
+                        if (name.equals(".git")) return false;
+                        if (p.startsWith(folder.resolve(".git"))) return false;
+                        // не трогаем явные ignore-файлы в корне
+                        for (String ig : ignore) {
+                            if (name.equals(ig) && p.getParent() != null && p.getParent().equals(folder)) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    })
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (IOException e) {
+                            throw new RuntimeException("Не смог удалить: " + p, e);
+                        }
+                    });
         }
     }
 
