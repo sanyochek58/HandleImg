@@ -9,7 +9,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
@@ -134,8 +133,30 @@ public class ImageScripts {
         }
 
         // ===== 6. "Коммитим изменения" =====
+
+
+        String buildVersion;
+
+        Path buildProp = folder.resolve("system").resolve("build.prop");
+        if (!Files.exists(buildProp)) {
+            throw new RuntimeException("build.prop not found: " + buildProp);
+        }
+
+        try (Stream<String> lines = Files.lines(buildProp)) {
+            buildVersion = lines
+                    .filter(l -> !l.startsWith("#"))
+                    .filter(l -> l.startsWith("ro.build.display.id="))
+                    .map(l -> l.substring(l.indexOf('=') + 1))
+                    .findFirst()
+                    .orElseThrow(() ->
+                            new RuntimeException("ro.build.display.id not found in build.prop"));
+        }
+
+        log.info("Build version for commit: {}", buildVersion);
+
+
         log.info("Коммитим изменения");
-        ProcessBuilder commitPb = new ProcessBuilder("git", "commit", "--allow-empty", "-m", "Auto-uploaded files");
+        ProcessBuilder commitPb = new ProcessBuilder("git", "commit", "--allow-empty", "-m", buildVersion);
         commitPb.directory(folder.toFile());
         commitPb.redirectErrorStream(true);
 
@@ -321,9 +342,19 @@ public class ImageScripts {
         log.info("Распаковываем новые образы в {}", targetDir.toAbsolutePath());
         for (Path img : images) {
             if (img == null) continue;
-            log.info("Распаковка: {}", img.toAbsolutePath());
-            extractImgWith7z(img, targetDir);
+
+            String fileName = img.getFileName().toString();
+            String folderName = fileName.contains(".")
+                    ? fileName.substring(0, fileName.lastIndexOf('.'))
+                    : fileName;
+
+            Path outDir = targetDir.resolve(folderName); // system / vendor
+            log.info("Распаковка: {} -> {}", img.toAbsolutePath(), outDir.toAbsolutePath());
+
+            extractImgWith7z(img, outDir);
         }
+
+        ApkScripts.decodeApksToProjectRoot(targetDir);
 
         // ===== 5. git add =====
         log.info("Добавление файлов образа в проект");
@@ -334,8 +365,29 @@ public class ImageScripts {
         if (addCode != 0) throw new RuntimeException("git add . failed with code " + addCode);
 
         // ===== 6. commit =====
+
+
+        String buildVersion;
+
+        Path buildProp = targetDir.resolve("system").resolve("build.prop");
+        if (!Files.exists(buildProp)) {
+            throw new RuntimeException("build.prop not found: " + buildProp);
+        }
+
+        try (Stream<String> lines = Files.lines(buildProp)) {
+            buildVersion = lines
+                    .filter(l -> !l.startsWith("#"))
+                    .filter(l -> l.startsWith("ro.build.display.id="))
+                    .map(l -> l.substring(l.indexOf('=') + 1))
+                    .findFirst()
+                    .orElseThrow(() ->
+                            new RuntimeException("ro.build.display.id not found in build.prop"));
+        }
+
+        log.info("Build version for commit: {}", buildVersion);
+
         log.info("Коммитим изменения");
-        ProcessBuilder commitPb = new ProcessBuilder("git", "commit", "--allow-empty", "-m", "Auto-update uploaded files");
+        ProcessBuilder commitPb = new ProcessBuilder("git", "commit", "--allow-empty", "-m", buildVersion);
         commitPb.directory(targetDir.toFile());
         commitPb.redirectErrorStream(true);
 
